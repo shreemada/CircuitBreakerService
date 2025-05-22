@@ -1,4 +1,5 @@
 ﻿using CircuitBreakerService.Contracts;
+using CircuitBreakerService.Infrastructure;
 using Confluent.Kafka;
 using Polly;
 using Polly.CircuitBreaker;
@@ -8,13 +9,13 @@ namespace CircuitBreakerService.Services;
 public class KafkaProducerService
 {
     private readonly IProducer<string, string> _producer;
-    private readonly IDistributedCircuitStateStore _stateStore;
+    private readonly IDistributedCircuitStateStore _stateStore; // Interface dependency
     private readonly ILogger<KafkaProducerService> _logger;
     private readonly AsyncCircuitBreakerPolicy _circuitBreaker;
 
     public KafkaProducerService(
         IProducer<string, string> producer,
-        IDistributedCircuitStateStore stateStore,
+        IDistributedCircuitStateStore stateStore, // Correct interface
         ILogger<KafkaProducerService> logger)
     {
         _producer = producer;

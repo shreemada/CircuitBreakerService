@@ -1,0 +1,109 @@
+Here's a modified approach to use Docker Compose only for infrastructure (Kafka/Zookeeper) while running the .NET app from Visual Studio:
+
+### 1. Simplified `docker-compose.yml`
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+```
+
+### 2. Application Configuration
+In your `appsettings.json`:
+```json
+{
+  "Kafka": {
+    "BootstrapServers": "localhost:9092"
+  }
+}
+```
+
+### 3. Execution Steps
+
+1. **Start only infrastructure containers**:
+```bash
+docker compose up -d zookeeper kafka
+```
+
+2. **Wait for Kafka to initialize** (30-60 seconds)
+
+3. **Create test topic**:
+```bash
+docker compose exec kafka kafka-topics \
+  --create \
+  --topic test-topic \
+  --partitions 1 \
+  --replication-factor 1 \
+  --bootstrap-server localhost:9092
+```
+
+4. **Run application from Visual Studio**:
+   - Open solution in VS
+   - Set `CircuitBreakerService` as startup project
+   - Press F5 to start debugging
+
+5. **Verify containers**:
+```bash
+docker compose ps
+```
+
+### 4. Testing Commands
+
+**Produce test messages**:
+```bash
+docker compose exec kafka bash -c \
+  "seq 100 | kafka-console-producer --topic test-topic --bootstrap-server localhost:9092"
+```
+
+**Monitor consumer group**:
+```bash
+docker compose exec kafka kafka-consumer-groups \
+  --describe \
+  --group your-consumer-group \
+  --bootstrap-server localhost:9092
+```
+
+### 5. Key Benefits
+- No need for Dockerfile
+- Kafka/Zookeeper managed by Docker
+- .NET app runs natively in Visual Studio
+- Easy debugging and hot-reload
+
+### 6. Cleanup
+```bash
+docker compose down -v
+```
+
+docker compose exec kafka kafka-topics --create --topic target-topic --partitions 1 --replication-factor 1 --bootstrap-server localhost:9092
+docker compose exec kafka kafka-topics --list --bootstrap-server localhost:9092
+
+# 1. Start services
+docker compose up -d
+
+# 2. Wait 30 seconds for Kafka initialization
+sleep 30
+
+# 3. Create topic
+docker compose exec kafka kafka-topics --create \
+  --topic target-topic \
+  --partitions 1 \
+  --replication-factor 1 \
+  --bootstrap-server localhost:9092
+
+# 4. Start your .NET application

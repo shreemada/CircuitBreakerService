@@ -1,37 +1,30 @@
-using CircuitBreakerService;
 using CircuitBreakerService.Contracts;
 using CircuitBreakerService.Infrastructure;
 using CircuitBreakerService.Services;
 using Confluent.Kafka;
-using StackExchange.Redis;
 
-// Program.cs
 var builder = Host.CreateApplicationBuilder(args);
 
-// Redis Configuration
-var redis = ConnectionMultiplexer.Connect("localhost");
-builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
-builder.Services.AddSingleton<IDistributedCircuitStateStore, RedisCircuitStateStore>();
+// Add in-memory state store
+builder.Services.AddSingleton<IDistributedCircuitStateStore, InMemoryCircuitStateStore>();
 
-// Kafka Consumers
+// Add Kafka consumer (hosted service)
 builder.Services.AddSingleton<IConsumer<Ignore, string>>(sp =>
     new ConsumerBuilder<Ignore, string>(new ConsumerConfig
     {
         BootstrapServers = "localhost:9092",
-        GroupId = $"consumer-group-{Guid.NewGuid()}",
+        GroupId = "consumer-group",
         AutoOffsetReset = AutoOffsetReset.Earliest,
         EnableAutoCommit = false
     }).Build());
 
 builder.Services.AddHostedService<KafkaConsumerService>();
 
-// Kafka Producers
+// Add Kafka producer
 builder.Services.AddSingleton<IProducer<string, string>>(sp =>
     new ProducerBuilder<string, string>(new ProducerConfig
     {
-        BootstrapServers = "localhost:9092",
-        MessageSendMaxRetries = 3,
-        EnableIdempotence = true
+        BootstrapServers = "localhost:9092"
     }).Build());
 
 builder.Services.AddSingleton<KafkaProducerService>();

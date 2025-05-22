@@ -1,4 +1,5 @@
 ﻿using CircuitBreakerService.Contracts;
+using CircuitBreakerService.Infrastructure;
 using Confluent.Kafka;
 
 namespace CircuitBreakerService.Services;
@@ -6,20 +7,20 @@ namespace CircuitBreakerService.Services;
 public class KafkaConsumerService : BackgroundService
 {
     private readonly IConsumer<Ignore, string> _consumer;
-    private readonly IDistributedCircuitStateStore _stateStore;
+    private readonly IDistributedCircuitStateStore _stateStore; // <-- Interface dependency
     private readonly ILogger<KafkaConsumerService> _logger;
-    private readonly string _circuitId = "downstream-service";
+    private readonly TimeSpan _circuitBreakDuration = TimeSpan.FromSeconds(30);
+    private const string CircuitId = "downstream-service";
 
     public KafkaConsumerService(
         IConsumer<Ignore, string> consumer,
-        IDistributedCircuitStateStore stateStore,
+        IDistributedCircuitStateStore stateStore, // Correct interface
         ILogger<KafkaConsumerService> logger)
     {
         _consumer = consumer;
         _stateStore = stateStore;
         _logger = logger;
     }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _consumer.Subscribe("target-topic");
@@ -28,7 +29,7 @@ public class KafkaConsumerService : BackgroundService
         {
             try
             {
-                var state = await _stateStore.GetCircuitStateAsync(_circuitId);
+                var state = await _stateStore.GetCircuitStateAsync(CircuitId);
 
                 if (state == CircuitState.Open)
                 {
@@ -52,22 +53,21 @@ public class KafkaConsumerService : BackgroundService
     {
         try
         {
-            // Business logic here
-            //await ProcessMessageAsync(result.Message.Value);
-            await _stateStore.ResetFailureCountAsync(_circuitId);
+            await ProcessMessageAsync(result.Message.Value);
+            await _stateStore.ResetFailureCountAsync(CircuitId);
             _consumer.Commit(result);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Message processing failed");
-            var failures = await _stateStore.IncrementFailureCountAsync(_circuitId);
+            var failures = await _stateStore.IncrementFailureCountAsync(CircuitId);
 
             if (failures >= 5)
             {
                 await _stateStore.SetCircuitStateAsync(
-                    _circuitId,
+                    CircuitId,
                     CircuitState.Open,
-                    TimeSpan.FromSeconds(30));
+                    _circuitBreakDuration);
             }
             throw;
         }
@@ -76,15 +76,13 @@ public class KafkaConsumerService : BackgroundService
     private async Task HandleOpenCircuitAsync(CancellationToken ct)
     {
         _logger.LogWarning("Circuit is open. Pausing consumption...");
-        _consumer.Pause(_consumer.Assignment);
+        await Task.Delay(_circuitBreakDuration, ct);
+        await _stateStore.SetCircuitStateAsync(CircuitId, CircuitState.HalfOpen);
+    }
 
-        if (await _stateStore.AcquireProbeLeadershipAsync(_circuitId, Environment.MachineName))
-        {
-            _logger.LogInformation("Acquired leadership for circuit probe");
-            await Task.Delay(TimeSpan.FromSeconds(30), ct);
-            await _stateStore.SetCircuitStateAsync(_circuitId, CircuitState.HalfOpen);
-        }
-
-        _consumer.Resume(_consumer.Assignment);
+    private async Task ProcessMessageAsync(string message)
+    {
+        // Your message processing logic
+        await Task.Delay(100); // Simulate work
     }
 }
