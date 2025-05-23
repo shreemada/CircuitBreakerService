@@ -6,23 +6,18 @@ namespace CircuitBreakerService.Infrastructure;
 public class InMemoryCircuitStateStore : IDistributedCircuitStateStore
 {
     private readonly IMemoryCache _cache = new MemoryCache(new MemoryCacheOptions());
-    private readonly TimeSpan _failureExpiration = TimeSpan.FromMinutes(5);
+    private readonly TimeSpan _defaultTtl = TimeSpan.FromMinutes(5);
 
     public Task<int> IncrementFailureCountAsync(string circuitId)
     {
         var key = $"{circuitId}-failures";
         var count = _cache.GetOrCreate(key, entry =>
         {
-            entry.SlidingExpiration = _failureExpiration;
+            entry.AbsoluteExpirationRelativeToNow = _defaultTtl;
             return 0;
-        });
+        }) + 1;
 
-        count++;
-        _cache.Set(key, count, new MemoryCacheEntryOptions
-        {
-            SlidingExpiration = _failureExpiration
-        });
-
+        _cache.Set(key, count, _defaultTtl);
         return Task.FromResult(count);
     }
 
@@ -40,9 +35,10 @@ public class InMemoryCircuitStateStore : IDistributedCircuitStateStore
 
     public Task SetCircuitStateAsync(string circuitId, CircuitState state, TimeSpan? ttl = null)
     {
-        var options = new MemoryCacheEntryOptions();
-        if (ttl.HasValue)
-            options.AbsoluteExpirationRelativeToNow = ttl;
+        var options = new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = ttl ?? _defaultTtl
+        };
 
         _cache.Set($"{circuitId}-state", state, options);
         return Task.CompletedTask;

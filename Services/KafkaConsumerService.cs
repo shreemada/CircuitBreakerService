@@ -1,26 +1,29 @@
 ﻿using CircuitBreakerService.Contracts;
-using CircuitBreakerService.Infrastructure;
 using Confluent.Kafka;
 
+
 namespace CircuitBreakerService.Services;
+
 
 public class KafkaConsumerService : BackgroundService
 {
     private readonly IConsumer<Ignore, string> _consumer;
-    private readonly IDistributedCircuitStateStore _stateStore; // <-- Interface dependency
+    private readonly IDistributedCircuitStateStore _stateStore;
     private readonly ILogger<KafkaConsumerService> _logger;
+    private const string CircuitId = "consumer-circuit";
     private readonly TimeSpan _circuitBreakDuration = TimeSpan.FromSeconds(30);
-    private const string CircuitId = "downstream-service";
+    private bool _isPaused;
 
     public KafkaConsumerService(
         IConsumer<Ignore, string> consumer,
-        IDistributedCircuitStateStore stateStore, // Correct interface
+        IDistributedCircuitStateStore stateStore,
         ILogger<KafkaConsumerService> logger)
     {
         _consumer = consumer;
         _stateStore = stateStore;
         _logger = logger;
     }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _consumer.Subscribe("target-topic");
@@ -30,59 +33,73 @@ public class KafkaConsumerService : BackgroundService
             try
             {
                 var state = await _stateStore.GetCircuitStateAsync(CircuitId);
+                await ManageCircuitStateAsync(state);
 
-                if (state == CircuitState.Open)
+                if (_isPaused)
                 {
-                    await HandleOpenCircuitAsync(stoppingToken);
+                    await Task.Delay(5000, stoppingToken);
                     continue;
                 }
 
                 var result = _consumer.Consume(stoppingToken);
-                await ProcessMessageWithCircuitBreakerAsync(result, stoppingToken);
+                if (result?.Message == null) continue;
+
+                await ProcessMessageAsync(result.Message.Value);
+                await _stateStore.ResetFailureCountAsync(CircuitId);
+                _consumer.Commit(result);
             }
-            catch (ConsumeException e)
+            catch (ConsumeException ex)
             {
-                _logger.LogError(e, "Consume error");
+                await HandleConsumeErrorAsync(ex);
             }
         }
     }
 
-    private async Task ProcessMessageWithCircuitBreakerAsync(
-        ConsumeResult<Ignore, string> result,
-        CancellationToken ct)
+    private async Task ManageCircuitStateAsync(CircuitState state)
     {
-        try
+        switch (state)
         {
-            await ProcessMessageAsync(result.Message.Value);
-            await _stateStore.ResetFailureCountAsync(CircuitId);
-            _consumer.Commit(result);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Message processing failed");
-            var failures = await _stateStore.IncrementFailureCountAsync(CircuitId);
+            case CircuitState.Open when !_isPaused:
+                _logger.LogWarning("Pausing consumption due to open circuit");
+                _consumer.Pause(_consumer.Assignment);
+                _isPaused = true;
+                break;
 
-            if (failures >= 5)
-            {
-                await _stateStore.SetCircuitStateAsync(
-                    CircuitId,
-                    CircuitState.Open,
-                    _circuitBreakDuration);
-            }
-            throw;
+            case CircuitState.Closed when _isPaused:
+                _logger.LogInformation("Resuming consumption");
+                _consumer.Resume(_consumer.Assignment);
+                _isPaused = false;
+                break;
         }
-    }
-
-    private async Task HandleOpenCircuitAsync(CancellationToken ct)
-    {
-        _logger.LogWarning("Circuit is open. Pausing consumption...");
-        await Task.Delay(_circuitBreakDuration, ct);
-        await _stateStore.SetCircuitStateAsync(CircuitId, CircuitState.HalfOpen);
     }
 
     private async Task ProcessMessageAsync(string message)
     {
-        // Your message processing logic
-        await Task.Delay(100); // Simulate work
+        // Simulate processing - throw every 3rd message
+        if (DateTime.UtcNow.Second % 3 == 0)
+            throw new InvalidOperationException("Simulated processing failure");
+
+        await Task.Delay(100);
+        _logger.LogInformation($"Processed message: {message}");
+    }
+
+    private async Task HandleConsumeErrorAsync(ConsumeException ex)
+    {
+        _logger.LogError(ex.Error.Reason);
+        var failures = await _stateStore.IncrementFailureCountAsync(CircuitId);
+
+        if (failures >= 3)
+        {
+            await _stateStore.SetCircuitStateAsync(
+                CircuitId,
+                CircuitState.Open,
+                _circuitBreakDuration);
+        }
+    }
+
+    public override void Dispose()
+    {
+        _consumer.Close();
+        base.Dispose();
     }
 }
