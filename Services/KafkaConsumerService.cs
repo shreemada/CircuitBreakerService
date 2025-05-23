@@ -1,105 +1,152 @@
 ﻿using CircuitBreakerService.Contracts;
+using CircuitBreakerService.Infrastructure;
+using CircuitBreakerService.Models;
 using Confluent.Kafka;
 
-
 namespace CircuitBreakerService.Services;
-
 
 public class KafkaConsumerService : BackgroundService
 {
     private readonly IConsumer<Ignore, string> _consumer;
-    private readonly IDistributedCircuitStateStore _stateStore;
+    private readonly IMessageProcessor _messageProcessor;
+    private readonly DistributedCircuitBreaker _circuitBreaker;
     private readonly ILogger<KafkaConsumerService> _logger;
-    private const string CircuitId = "consumer-circuit";
-    private readonly TimeSpan _circuitBreakDuration = TimeSpan.FromSeconds(30);
-    private bool _isPaused;
+    private readonly string _topic;
+    private readonly string _consumerName;
 
     public KafkaConsumerService(
         IConsumer<Ignore, string> consumer,
-        IDistributedCircuitStateStore stateStore,
-        ILogger<KafkaConsumerService> logger)
+        IMessageProcessor messageProcessor,
+        ICircuitBreakerFactory circuitBreakerFactory,
+        ILogger<KafkaConsumerService> logger,
+        IConfiguration configuration)
     {
         _consumer = consumer;
-        _stateStore = stateStore;
+        _messageProcessor = messageProcessor;
         _logger = logger;
+        _topic = configuration.GetValue<string>("Kafka:ConsumerTopic") ?? "default-topic";
+        _consumerName = $"consumer-{Environment.MachineName}-{Guid.NewGuid():N}";
+        _circuitBreaker = circuitBreakerFactory.CreateCircuitBreaker($"consumer-{_consumerName}");
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _consumer.Subscribe("target-topic");
+        _consumer.Subscribe(_topic);
+        _logger.LogInformation("Kafka consumer {ConsumerName} started, subscribed to topic {Topic}", _consumerName, _topic);
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                var state = await _stateStore.GetCircuitStateAsync(CircuitId);
-                await ManageCircuitStateAsync(state);
+                await ConsumeMessages(stoppingToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Kafka consumer {ConsumerName} stopping due to cancellation", _consumerName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fatal error in Kafka consumer {ConsumerName}", _consumerName);
+        }
+        finally
+        {
+            _consumer.Close();
+            _consumer.Dispose();
+            _logger.LogInformation("Kafka consumer {ConsumerName} stopped", _consumerName);
+        }
+    }
 
-                if (_isPaused)
+    private async Task ConsumeMessages(CancellationToken stoppingToken)
+    {
+        try
+        {
+            // Check if circuit breaker is open before consuming
+            if (await _circuitBreaker.IsCircuitOpenAsync())
+            {
+                _logger.LogDebug("Circuit breaker is open, pausing consumption for {ConsumerName}", _consumerName);
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                return;
+            }
+
+            var consumeResult = _consumer.Consume(TimeSpan.FromSeconds(1));
+
+            if (consumeResult?.Message != null)
+            {
+                await ProcessMessage(consumeResult, stoppingToken);
+            }
+        }
+        catch (ConsumeException ex)
+        {
+            _logger.LogError(ex, "Error consuming message in {ConsumerName}: {Error}", _consumerName, ex.Error.Reason);
+            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in consumer {ConsumerName}", _consumerName);
+            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+        }
+    }
+
+    private async Task ProcessMessage(ConsumeResult<Ignore, string> consumeResult, CancellationToken stoppingToken)
+    {
+        var kafkaMessage = new KafkaMessage
+        {
+            Key = consumeResult.Message.Key?.ToString() ?? string.Empty,
+            Value = consumeResult.Message.Value ?? string.Empty,
+            Topic = consumeResult.Topic,
+            Partition = consumeResult.Partition.Value,
+            Offset = consumeResult.Offset.Value,
+            Timestamp = consumeResult.Message.Timestamp.UtcDateTime
+        };
+
+        _logger.LogDebug("Processing message from {Topic}:{Partition}:{Offset}",
+            kafkaMessage.Topic, kafkaMessage.Partition, kafkaMessage.Offset);
+
+        try
+        {
+            var result = await _circuitBreaker.ExecuteAsync(async () =>
+            {
+                var processingResult = await _messageProcessor.ProcessMessageAsync(kafkaMessage, stoppingToken);
+
+                if (!processingResult.IsSuccess)
                 {
-                    await Task.Delay(5000, stoppingToken);
-                    continue;
+                    throw new InvalidOperationException($"Message processing failed: {processingResult.ErrorMessage}");
                 }
 
-                var result = _consumer.Consume(stoppingToken);
-                if (result?.Message == null) continue;
+                return processingResult;
+            });
 
-                await ProcessMessageAsync(result.Message.Value);
-                await _stateStore.ResetFailureCountAsync(CircuitId);
-                _consumer.Commit(result);
-            }
-            catch (ConsumeException ex)
-            {
-                await HandleConsumeErrorAsync(ex);
-            }
+            // Commit offset only on successful processing
+            _consumer.Commit(consumeResult);
+            _logger.LogDebug("Successfully processed and committed message from {Topic}:{Partition}:{Offset}",
+                kafkaMessage.Topic, kafkaMessage.Partition, kafkaMessage.Offset);
         }
-    }
-
-    private async Task ManageCircuitStateAsync(CircuitState state)
-    {
-        switch (state)
+        catch (CircuitBreakerOpenException)
         {
-            case CircuitState.Open when !_isPaused:
-                _logger.LogWarning("Pausing consumption due to open circuit");
-                _consumer.Pause(_consumer.Assignment);
-                _isPaused = true;
-                break;
+            _logger.LogWarning("Circuit breaker is open, will retry message from {Topic}:{Partition}:{Offset} later",
+                kafkaMessage.Topic, kafkaMessage.Partition, kafkaMessage.Offset);
 
-            case CircuitState.Closed when _isPaused:
-                _logger.LogInformation("Resuming consumption");
-                _consumer.Resume(_consumer.Assignment);
-                _isPaused = false;
-                break;
+            // Don't commit offset when circuit breaker is open
+            // Message will be reprocessed when circuit closes
         }
-    }
-
-    private async Task ProcessMessageAsync(string message)
-    {
-        // Simulate processing - throw every 3rd message
-        if (DateTime.UtcNow.Second % 3 == 0)
-            throw new InvalidOperationException("Simulated processing failure");
-
-        await Task.Delay(100);
-        _logger.LogInformation($"Processed message: {message}");
-    }
-
-    private async Task HandleConsumeErrorAsync(ConsumeException ex)
-    {
-        _logger.LogError(ex.Error.Reason);
-        var failures = await _stateStore.IncrementFailureCountAsync(CircuitId);
-
-        if (failures >= 3)
+        catch (Exception ex)
         {
-            await _stateStore.SetCircuitStateAsync(
-                CircuitId,
-                CircuitState.Open,
-                _circuitBreakDuration);
+            _logger.LogError(ex, "Failed to process message from {Topic}:{Partition}:{Offset}",
+                kafkaMessage.Topic, kafkaMessage.Partition, kafkaMessage.Offset);
+
+            // Don't commit offset on processing failure
+            // Message will be reprocessed
         }
     }
 
     public override void Dispose()
     {
-        _consumer.Close();
+        _consumer?.Dispose();
         base.Dispose();
     }
 }

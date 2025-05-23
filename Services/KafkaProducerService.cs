@@ -1,101 +1,153 @@
 ﻿using CircuitBreakerService.Contracts;
+using CircuitBreakerService.Infrastructure;
+using CircuitBreakerService.Models;
 using Confluent.Kafka;
-using Polly;
-using Polly.CircuitBreaker;
-using CircuitState = CircuitBreakerService.Contracts.CircuitState;
+using System.Text.Json;
 
 namespace CircuitBreakerService.Services;
-public class KafkaProducerService : BackgroundService
+
+public interface IKafkaProducerService
+{
+    Task<bool> PublishMessageAsync(string topic, string key, object message, CancellationToken cancellationToken = default);
+    Task<bool> PublishMessageAsync(string topic, string message, CancellationToken cancellationToken = default);
+}
+
+public class KafkaProducerService : BackgroundService, IKafkaProducerService
 {
     private readonly IProducer<string, string> _producer;
-    private readonly IDistributedCircuitStateStore _stateStore;
+    private readonly DistributedCircuitBreaker _circuitBreaker;
     private readonly ILogger<KafkaProducerService> _logger;
-    private readonly AsyncCircuitBreakerPolicy<DeliveryResult<string, string>> _circuitBreaker;
-    private const string CircuitId = "producer-circuit";
-    private readonly TimeSpan _circuitBreakDuration = TimeSpan.FromSeconds(30);
+    private readonly string _producerName;
+    private readonly SemaphoreSlim _producerSemaphore;
 
     public KafkaProducerService(
         IProducer<string, string> producer,
-        IDistributedCircuitStateStore stateStore,
+        ICircuitBreakerFactory circuitBreakerFactory,
         ILogger<KafkaProducerService> logger)
     {
         _producer = producer;
-        _stateStore = stateStore;
         _logger = logger;
+        _producerName = $"producer-{Environment.MachineName}-{Guid.NewGuid():N}";
+        _circuitBreaker = circuitBreakerFactory.CreateCircuitBreaker($"producer-{_producerName}");
+        _producerSemaphore = new SemaphoreSlim(10, 10); // Limit concurrent operations
+    }
 
-        _circuitBreaker = Policy<DeliveryResult<string, string>>
-            .Handle<ProduceException<string, string>>()
-            .OrResult(r => r.Status != PersistenceStatus.Persisted)
-            .CircuitBreakerAsync(
-                handledEventsAllowedBeforeBreaking: 3,
-                durationOfBreak: _circuitBreakDuration,
-                onBreak: async (result, duration) => await OnCircuitBreakAsync(result, duration),
-                onReset: async () => await OnCircuitResetAsync());
+    public async Task<bool> PublishMessageAsync(string topic, string key, object message, CancellationToken cancellationToken = default)
+    {
+        var messageJson = JsonSerializer.Serialize(message);
+        return await PublishMessageInternalAsync(topic, key, messageJson, cancellationToken);
+    }
+
+    public async Task<bool> PublishMessageAsync(string topic, string message, CancellationToken cancellationToken = default)
+    {
+        return await PublishMessageInternalAsync(topic, null, message, cancellationToken);
+    }
+
+    private async Task<bool> PublishMessageInternalAsync(string topic, string? key, string message, CancellationToken cancellationToken = default)
+    {
+        await _producerSemaphore.WaitAsync(cancellationToken);
+
+        try
+        {
+            return await _circuitBreaker.ExecuteAsync(async () =>
+            {
+                var kafkaMessage = new Message<string, string>
+                {
+                    Key = key,
+                    Value = message,
+                    Timestamp = new Timestamp(DateTimeOffset.UtcNow)
+                };
+
+                _logger.LogDebug("Publishing message to topic {Topic} with key {Key}", topic, key ?? "null");
+
+                var deliveryResult = await _producer.ProduceAsync(topic, kafkaMessage, cancellationToken);
+
+                HandleDeliveryResult(deliveryResult);
+
+                _logger.LogDebug("Successfully published message to {Topic}:{Partition}:{Offset}",
+                    deliveryResult.Topic, deliveryResult.Partition.Value, deliveryResult.Offset.Value);
+
+                return true;
+            });
+        }
+        catch (Polly.CircuitBreaker.BrokenCircuitException) //CircuitBreakerOpenException)
+        {
+            _logger.LogWarning("Circuit breaker is open, message publication to topic {Topic} failed", topic);
+            return false;
+        }
+        catch (ProduceException<string, string> ex)
+        {
+            _logger.LogError(ex, "Failed to publish message to topic {Topic}: {Error}", topic, ex.Error.Reason);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error publishing message to topic {Topic}", topic);
+            return false;
+        }
+        finally
+        {
+            _producerSemaphore.Release();
+        }
+    }
+
+    private void HandleDeliveryResult(DeliveryResult<string, string> deliveryResult)
+    {
+        if (deliveryResult.Status == PersistenceStatus.NotPersisted)
+        {
+            throw new InvalidOperationException($"Message was not persisted to topic {deliveryResult.Topic}");
+        }
+
+        if (deliveryResult.Status == PersistenceStatus.PossiblyPersisted)
+        {
+            _logger.LogWarning("Message to topic {Topic} may not have been persisted", deliveryResult.Topic);
+        }
+
+        // Log successful delivery
+        _logger.LogDebug("Message delivered to {Topic}:{Partition}:{Offset} with status {Status}",
+            deliveryResult.Topic,
+            deliveryResult.Partition.Value,
+            deliveryResult.Offset.Value,
+            deliveryResult.Status);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var messageCount = 0;
-        while (!stoppingToken.IsCancellationRequested)
+        _logger.LogInformation("Kafka producer service {ProducerName} started", _producerName);
+
+        try
         {
-            try
+            // Keep the service running
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await _circuitBreaker.ExecuteAsync(async () =>
-                {
-                    var message = new Message<string, string>
-                    {
-                        Key = messageCount.ToString(),
-                        Value = $"Message-{messageCount++}"
-                    };
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
 
-                    var result = await _producer.ProduceAsync("target-topic", message, stoppingToken);
-                    HandleDeliveryResult(result);
-                    return result;
-                });
-
-                await Task.Delay(1000, stoppingToken);
-            }
-            catch (BrokenCircuitException)
-            {
-                _logger.LogWarning("Producer circuit open. Waiting to resume...");
-                await Task.Delay(_circuitBreakDuration, stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Critical producer error");
+                // Optionally monitor circuit breaker state
+                var circuitState = await _circuitBreaker.GetStateAsync();
+                _logger.LogDebug("Producer {ProducerName} circuit breaker state: {State}", _producerName, circuitState);
             }
         }
-    }
-
-    private void HandleDeliveryResult(DeliveryResult<string, string> result)
-    {
-        if (result.Status == PersistenceStatus.Persisted)
+        catch (OperationCanceledException)
         {
-            _logger.LogInformation($"Delivered to {result.TopicPartitionOffset}");
-            return;
+            _logger.LogInformation("Kafka producer service {ProducerName} stopping due to cancellation", _producerName);
         }
-
-        _logger.LogError("Message delivery failed.");
-        throw new ProduceException<string, string>(new Error(ErrorCode.BrokerNotAvailable,"Message delivery failed."), result);
-    }
-
-    private async Task OnCircuitBreakAsync(
-        DelegateResult<DeliveryResult<string, string>> result,
-        TimeSpan duration)
-    {
-        await _stateStore.SetCircuitStateAsync(CircuitId, CircuitState.Open, duration);
-        _logger.LogWarning($"Circuit opened: {result.Result}");
-    }
-
-    private async Task OnCircuitResetAsync()
-    {
-        await _stateStore.SetCircuitStateAsync(CircuitId, CircuitState.Closed);
-        _logger.LogInformation("Producer circuit reset");
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fatal error in Kafka producer service {ProducerName}", _producerName);
+        }
+        finally
+        {
+            _producer.Flush(TimeSpan.FromSeconds(10));
+            _producer.Dispose();
+            _producerSemaphore.Dispose();
+            _logger.LogInformation("Kafka producer service {ProducerName} stopped", _producerName);
+        }
     }
 
     public override void Dispose()
     {
-        _producer.Flush(TimeSpan.FromSeconds(5));
+        _producer?.Dispose();
+        _producerSemaphore?.Dispose();
         base.Dispose();
     }
 }

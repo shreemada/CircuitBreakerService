@@ -1,52 +1,133 @@
 ﻿using CircuitBreakerService.Contracts;
-using Microsoft.Extensions.Caching.Memory;
+using CircuitBreakerService.Models;
+using Polly.CircuitBreaker;
+using System.Collections.Concurrent;
 
 namespace CircuitBreakerService.Infrastructure;
 
 public class InMemoryCircuitStateStore : IDistributedCircuitStateStore
 {
-    private readonly IMemoryCache _cache = new MemoryCache(new MemoryCacheOptions());
-    private readonly TimeSpan _defaultTtl = TimeSpan.FromMinutes(5);
+    private readonly ConcurrentDictionary<string, CircuitInfo> _circuitStates = new();
+    private readonly ConcurrentDictionary<string, (SemaphoreSlim semaphore, DateTimeOffset expiry)> _locks = new();
+    private readonly ILogger<InMemoryCircuitStateStore> _logger;
 
-    public Task<int> IncrementFailureCountAsync(string circuitId)
+    public InMemoryCircuitStateStore(ILogger<InMemoryCircuitStateStore> logger)
     {
-        var key = $"{circuitId}-failures";
-        var count = _cache.GetOrCreate(key, entry =>
-        {
-            entry.AbsoluteExpirationRelativeToNow = _defaultTtl;
-            return 0;
-        }) + 1;
-
-        _cache.Set(key, count, _defaultTtl);
-        return Task.FromResult(count);
+        _logger = logger;
     }
 
-    public Task ResetFailureCountAsync(string circuitId)
+    public Task<CircuitState> GetCircuitStateAsync(string circuitName)
     {
-        _cache.Remove($"{circuitId}-failures");
+        var circuitInfo = _circuitStates.GetOrAdd(circuitName, _ => new CircuitInfo
+        {
+            CircuitName = circuitName,
+            State = CircuitState.Closed
+        });
+
+        return Task.FromResult(circuitInfo.State);
+    }
+
+    public Task SetCircuitStateAsync(string circuitName, CircuitState state)
+    {
+        _circuitStates.AddOrUpdate(circuitName,
+            new CircuitInfo { CircuitName = circuitName, State = state, OpenedAt = DateTimeOffset.UtcNow },
+            (key, existing) =>
+            {
+                existing.State = state;
+                if (state == CircuitState.Open)
+                    existing.OpenedAt = DateTimeOffset.UtcNow;
+                return existing;
+            });
+
+        _logger.LogInformation("Circuit {CircuitName} state changed to {State}", circuitName, state);
         return Task.CompletedTask;
     }
 
-    public Task<CircuitState> GetCircuitStateAsync(string circuitId)
+    public async Task<bool> TryLockAsync(string circuitName, TimeSpan lockDuration)
     {
-        var state = _cache.Get<CircuitState?>($"{circuitId}-state");
-        return Task.FromResult(state ?? CircuitState.Closed);
+        var now = DateTimeOffset.UtcNow;
+        var expiry = now.Add(lockDuration);
+
+        var lockInfo = _locks.AddOrUpdate(circuitName,
+            (new SemaphoreSlim(1, 1), expiry),
+            (key, existing) =>
+            {
+                if (existing.expiry < now)
+                {
+                    existing.semaphore.Dispose();
+                    return (new SemaphoreSlim(1, 1), expiry);
+                }
+                return existing;
+            });
+
+        return await lockInfo.semaphore.WaitAsync(TimeSpan.FromMilliseconds(100));
     }
 
-    public Task SetCircuitStateAsync(string circuitId, CircuitState state, TimeSpan? ttl = null)
+    public Task ReleaseLockAsync(string circuitName)
     {
-        var options = new MemoryCacheEntryOptions
+        if (_locks.TryGetValue(circuitName, out var lockInfo))
         {
-            AbsoluteExpirationRelativeToNow = ttl ?? _defaultTtl
-        };
-
-        _cache.Set($"{circuitId}-state", state, options);
+            lockInfo.semaphore.Release();
+        }
         return Task.CompletedTask;
     }
 
-    public Task<bool> AcquireProbeLeadershipAsync(string circuitId, string instanceId)
+    public Task IncrementFailureCountAsync(string circuitName)
     {
-        // Leadership not needed in single instance
-        return Task.FromResult(true);
+        _circuitStates.AddOrUpdate(circuitName,
+            new CircuitInfo { CircuitName = circuitName, FailureCount = 1 },
+            (key, existing) =>
+            {
+                existing.FailureCount++;
+                return existing;
+            });
+
+        return Task.CompletedTask;
+    }
+
+    public Task ResetFailureCountAsync(string circuitName)
+    {
+        _circuitStates.AddOrUpdate(circuitName,
+            new CircuitInfo { CircuitName = circuitName, FailureCount = 0 },
+            (key, existing) =>
+            {
+                existing.FailureCount = 0;
+                return existing;
+            });
+
+        return Task.CompletedTask;
+    }
+
+    public Task<int> GetFailureCountAsync(string circuitName)
+    {
+        var circuitInfo = _circuitStates.GetOrAdd(circuitName, _ => new CircuitInfo
+        {
+            CircuitName = circuitName
+        });
+
+        return Task.FromResult(circuitInfo.FailureCount);
+    }
+
+    public Task SetLastFailureTimeAsync(string circuitName, DateTimeOffset timestamp)
+    {
+        _circuitStates.AddOrUpdate(circuitName,
+            new CircuitInfo { CircuitName = circuitName, LastFailureTime = timestamp },
+            (key, existing) =>
+            {
+                existing.LastFailureTime = timestamp;
+                return existing;
+            });
+
+        return Task.CompletedTask;
+    }
+
+    public Task<DateTimeOffset?> GetLastFailureTimeAsync(string circuitName)
+    {
+        var circuitInfo = _circuitStates.GetOrAdd(circuitName, _ => new CircuitInfo
+        {
+            CircuitName = circuitName
+        });
+
+        return Task.FromResult(circuitInfo.LastFailureTime);
     }
 }
